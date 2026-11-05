@@ -117,20 +117,20 @@ python main_demo.py
 
 Or use command line directly:
 ```bash
-cd backend/ai/agent
-python run_extract_all.py
+python -m backend.ai.agent.run_extract_all
 ```
 
 This will:
-- Find all PDFs in `data/raw_papers/`
+- Find all PDFs in `backend/ai/agent/data/raw_papers/`
 - Extract questions from each PDF
-- Save results to `outputs/extracted_questions_all.json`
+- Save results to `backend/ai/agent/outputs/extracted_questions_all.json`
 
 #### Step 4: View Results
 
 ```bash
 # View extracted questions
-cat backend/ai/agent/outputs/extracted_questions_all.json
+Get-Content backend/ai/agent/outputs/extracted_questions_all.json  # PowerShell
+# macOS/Linux: cat backend/ai/agent/outputs/extracted_questions_all.json
 ```
 
 Results include:

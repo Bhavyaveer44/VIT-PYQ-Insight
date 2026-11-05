@@ -1,5 +1,6 @@
 import os
 from dotenv import load_dotenv
+from backend.ai.ollama_utils import ollama_config, ollama_preflight
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -13,13 +14,19 @@ def summarize_pdf():
     load_dotenv()
 
     # === Load PDF ===
-    pdf_path = input("📄 Enter path to your PDF: ")
-    if not os.path.exists(pdf_path):
-        print("❌ File does not exist.")
+    pdf_path = input("📄 Enter path to your PDF: ").strip().strip('"')
+    if not os.path.isfile(pdf_path):
+        print(f"❌ PDF file does not exist: {pdf_path}")
+        return
+    if not pdf_path.lower().endswith(".pdf"):
+        print("❌ Please choose a file with a .pdf extension.")
         return
 
     loader = PyPDFLoader(pdf_path)
     docs = loader.load()
+    if not docs or not any(doc.page_content.strip() for doc in docs):
+        print("❌ No readable text found in this PDF. It may be scanned; run OCR first.")
+        return
     print(f"✅ Loaded {len(docs)} pages")
 
     # === Chunk PDF ===
@@ -32,12 +39,17 @@ def summarize_pdf():
         return
 
     # === Create Embeddings (using Ollama locally) ===
-    embeddings = OllamaEmbeddings(model="snowflake-arctic-embed")
+    error = ollama_preflight()
+    if error:
+        print(f"❌ {error}")
+        return
+    _, model, embedding_model = ollama_config()
+    embeddings = OllamaEmbeddings(model=embedding_model)
     vectorstore = FAISS.from_documents(chunks, embeddings)
     retriever = vectorstore.as_retriever()
 
     # === Load LLM (via Ollama) ===
-    llm = ChatOllama(model="koesn/llama3-8b-instruct:latest")
+    llm = ChatOllama(model=model)
 
     def format_docs(docs):
         return "\n\n".join(doc.page_content for doc in docs)

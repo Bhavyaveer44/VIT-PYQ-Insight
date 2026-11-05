@@ -40,13 +40,13 @@ python -c "from scraper import ExamScraper; scraper = ExamScraper(); scraper.scr
 
 ### Extract Questions Only
 ```bash
-cd backend/ai/agent
-python run_extract_all.py
+python -m backend.ai.agent.run_extract_all
 ```
 
 ### View Results
 ```bash
-cat backend/ai/agent/outputs/extracted_questions_all.json
+Get-Content backend/ai/agent/outputs/extracted_questions_all.json  # PowerShell
+# macOS/Linux: cat backend/ai/agent/outputs/extracted_questions_all.json
 ```
 
 ---
@@ -139,8 +139,8 @@ Try different subject names or check if the website structure changed
 | Full setup | `pip install -r requirements.txt && playwright install` |
 | Run menu | `python main_demo.py` |
 | Scrape papers | Option 3 in menu, OR `cd backend/ai/agent && python -c "from scraper import ExamScraper; ExamScraper().scrape_papers('Computer Science', max_papers=5)"` |
-| Extract questions | Option 4 in menu, OR `cd backend/ai/agent && python run_extract_all.py` |
-| View results | `cat backend/ai/agent/outputs/extracted_questions_all.json` |
+| Extract questions | Option 4 in menu, OR `python -m backend.ai.agent.run_extract_all` |
+| View results | `backend/ai/agent/outputs/extracted_questions_all.json` |
 | Check git status | `git status` (verify .env not listed) |
 
 Happy scraping! 📚

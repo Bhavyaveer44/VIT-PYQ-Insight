@@ -3,7 +3,7 @@ PDF question extractor with robust header/footer removal, page-number stripping,
 Extraction flow:
 - Try pdfplumber word-level extraction grouped by Y to preserve symbols.
 - Clean each page: strip very short lines, remove page-number/header patterns, detect repeated first/last lines across pages.
-- If pdf text is empty or too sparse, render pages with PyMuPDF at high DPI and OCR via pytesseract.
+- If pdf text is empty or too sparse, render pages with PyMuPDF at high DPI and OCR via EasyOCR.
 - Optionally pass cleaned text through an LLM cleaner (safe no-op by default) before question splitting.
 """
 import os
@@ -16,8 +16,15 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from m import print_info, print_success, print_error, print_progress, save_json
+from .m import print_info, print_success, print_error, print_progress, save_json
 import requests
+
+# Load .env (best effort) so OLLAMA_API_URL / OLLAMA_MODEL / MATHPIX_* are available.
+try:  # pragma: no cover - optional dependency
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 # Optional imports with graceful degradation
 try:
@@ -31,18 +38,16 @@ except Exception:  # pragma: no cover - optional dependency
     fitz = None  # type: ignore
 
 try:
-    import pytesseract  # type: ignore
     from PIL import Image  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
-    pytesseract = None  # type: ignore
     Image = None  # type: ignore
 
 
 class QuestionExtractor:
     def __init__(self):
-        # LLM related config (no-op unless user provides implementation)
-        self.model_name = "koesn/llama3-8b-instruct:latest"
-        # Enable LLM hook; it will only run when use_llm=True is passed in public API
+        # Local LLM (Ollama) configuration, overridable via environment.
+        self.ollama_url = os.getenv("OLLAMA_API_URL", "http://localhost:11434").rstrip("/")
+        self.model_name = os.getenv("OLLAMA_MODEL", "koesn/llama3-8b-instruct:latest")
         self.llm_enabled = True
         # MathPix credentials from env
         self.mathpix_app_id = os.getenv("MATHPIX_APP_ID")
@@ -80,7 +85,12 @@ class QuestionExtractor:
         return lines
 
     def _extract_with_pdfplumber(self, file_path: str) -> List[List[str]]:
-        """Return a list of pages, each a list of lines extracted via pdfplumber."""
+        """Return a list of pages, each a list of lines extracted via pdfplumber.
+
+        Uses pdfplumber's layout-aware ``extract_text(layout=True)`` which keeps
+        reading order and word spacing correct for the table-based VIT papers
+        (the previous word-by-word grouping scrambled multi-column layouts).
+        """
         if not pdfplumber:
             return []
         pages_lines: List[List[str]] = []
@@ -88,10 +98,10 @@ class QuestionExtractor:
             with pdfplumber.open(file_path) as pdf:
                 for page in pdf.pages:
                     try:
-                        words = page.extract_words(use_text_flow=True, keep_blank_chars=False) or []
-                        lines = self._words_to_lines(words)
+                        raw = page.extract_text(layout=True) or ""
+                        lines = [re.sub(r"\s+", " ", l).strip() for l in raw.splitlines()]
+                        lines = [l for l in lines if l]
                     except Exception:
-                        # fallback to simple text if words fail
                         raw = page.extract_text(x_tolerance=1.5, y_tolerance=3.0) or ""
                         lines = [l.strip() for l in raw.splitlines() if l.strip()]
                     pages_lines.append(lines)
@@ -101,7 +111,7 @@ class QuestionExtractor:
         return pages_lines
 
     # -----------------------
-    # OCR Fallback (PyMuPDF + pytesseract)
+    # OCR Fallback (PyMuPDF + EasyOCR)
     # -----------------------
     def _render_page_to_image(self, doc: "fitz.Document", page_index: int, dpi: int = 300):
         zoom = dpi / 72.0
@@ -110,24 +120,59 @@ class QuestionExtractor:
         pix = page.get_pixmap(matrix=mat, alpha=False)
         return pix
 
-    def _extract_with_ocr(self, file_path: str, dpi: int = 300) -> List[List[str]]:
-        if not (fitz and pytesseract and Image):
+    def _easyocr_to_lines(self, results: list, y_tol: int = 15) -> List[str]:
+        """Convert EasyOCR bounding boxes to reading-order lines (top→bottom, left→right)."""
+        if not results:
             return []
+        from collections import defaultdict as _dd
+        rows: Dict[int, List[tuple]] = _dd(list)
+        for (bbox, text, conf) in results:
+            if conf < 0.3 or not text.strip():
+                continue
+            top_y = int(bbox[0][1])
+            row_key = (top_y // y_tol) * y_tol
+            rows[row_key].append((float(bbox[0][0]), text.strip()))
+        lines: List[str] = []
+        for y in sorted(rows):
+            sorted_row = sorted(rows[y], key=lambda x: x[0])
+            line = " ".join(t for _, t in sorted_row).strip()
+            if line:
+                lines.append(line)
+        return lines
+
+    def _extract_with_ocr(self, file_path: str, dpi: int = 300) -> List[List[str]]:
+        """EasyOCR-based extraction for scanned/image PDFs. No external binary required."""
+        if not fitz:
+            print_error("PyMuPDF (fitz) not installed.")
+            return []
+        try:
+            import easyocr  # type: ignore
+            import numpy as np  # type: ignore
+        except ImportError:
+            print_error("easyocr not installed. Run: pip install easyocr")
+            return []
+
+        print_info("Initialising EasyOCR (first run downloads ~100 MB model)...")
+        reader = easyocr.Reader(['en'], gpu=False, verbose=False)
         pages_lines: List[List[str]] = []
         try:
             doc = fitz.open(file_path)
             for i in range(doc.page_count):
                 try:
                     pix = self._render_page_to_image(doc, i, dpi=dpi)
-                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                    text = pytesseract.image_to_string(img)
-                    lines = [l.strip() for l in text.splitlines() if l.strip()]
-                except Exception:
+                    # Reshape using the pixmap's actual channel count; drop alpha if present.
+                    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+                    if pix.n == 4:
+                        img = img[:, :, :3]
+                    results = reader.readtext(img, detail=1, paragraph=False)
+                    lines = self._easyocr_to_lines(results)
+                except Exception as e:
+                    print_error(f"EasyOCR failed on page {i + 1}: {e}")
                     lines = []
                 pages_lines.append(lines)
             doc.close()
         except Exception as e:
-            print_error(f"OCR fallback failed: {e}")
+            print_error(f"EasyOCR pass failed: {e}")
             return []
         return pages_lines
 
@@ -211,7 +256,7 @@ class QuestionExtractor:
                 "Text:\n" + text
             )
             resp = requests.post(
-                "http://localhost:11434/api/generate",
+                f"{self.ollama_url}/api/generate",
                 json={
                     "model": self.model_name,
                     "prompt": prompt,
@@ -230,6 +275,116 @@ class QuestionExtractor:
         except Exception as e:
             print_error(f"Ollama cleaning error: {e}")
             return text
+
+    # -----------------------
+    # LLM-based question extraction (Ollama)
+    # -----------------------
+    def _ollama_available(self) -> bool:
+        """Return True if a local Ollama server is reachable."""
+        try:
+            r = requests.get(f"{self.ollama_url}/api/tags", timeout=3)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    @staticmethod
+    def _parse_question_list(raw: str) -> List[str]:
+        """Parse an LLM response into a clean list of question strings.
+
+        Accepts a JSON array of strings, or a numbered/bulleted plain-text list.
+        """
+        raw = (raw or "").strip()
+        if not raw:
+            return []
+        # Strip code fences if the model wrapped the output.
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I | re.M).strip()
+
+        # 1) Try to locate and parse a JSON array.
+        m = re.search(r"\[.*\]", raw, flags=re.S)
+        if m:
+            try:
+                arr = json.loads(m.group(0))
+                if isinstance(arr, list):
+                    items = [str(x).strip() for x in arr if str(x).strip()]
+                    if items:
+                        return items
+            except Exception:
+                pass
+
+        # 2) Fall back to splitting a numbered/bulleted list.
+        items: List[str] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            line = re.sub(r"^[-*•]\s*", "", line)        # bullets
+            line = re.sub(r"^\(?\d+[\.\)]\s*", "", line)        # 1.  1)  (1)
+            line = re.sub(r"^Q(uestion)?\s*\d+[:\.\)]?\s*", "", line, flags=re.I)
+            if len(line) > 10:
+                items.append(line.strip())
+        return items
+
+    def _llm_extract_questions(self, text: str, topic: str = "") -> List[str]:
+        """Use the local LLM to extract every distinct question, verbatim.
+
+        Returns [] on any failure so the caller can fall back to the heuristic
+        parser.
+        """
+        if not text.strip():
+            return []
+        topic_clause = (
+            f"\nOnly include questions related to the topic: '{topic}'. "
+            "If none relate, return an empty array.\n" if topic else "\n"
+        )
+        prompt = (
+            "You are extracting exam questions from the messy OCR/extracted text of "
+            "a university exam paper.\n"
+            "Extract EVERY distinct question and sub-question (a, b, c, i, ii ...) "
+            "asked in the paper.\n"
+            "Rules:\n"
+            "- Reproduce each question's wording faithfully; fix only obvious OCR "
+            "spacing/hyphenation errors.\n"
+            "- Treat each labelled sub-part as its own separate question.\n"
+            "- IGNORE headers, footers, institute names, instructions, course "
+            "outcomes, marks, CO/BL columns, and page numbers.\n"
+            "- Do NOT invent questions or add commentary.\n"
+            f"{topic_clause}"
+            "Return ONLY a JSON array of strings, one string per question, with no "
+            "other text.\n\n"
+            "PAPER TEXT:\n" + text
+        )
+        # Try up to twice: the first call may hit a cold model load that returns
+        # an empty/odd response before the weights are resident in memory.
+        questions: List[str] = []
+        for attempt in range(2):
+            try:
+                resp = requests.post(
+                    f"{self.ollama_url}/api/generate",
+                    json={
+                        "model": self.model_name,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {"temperature": 0.1, "num_ctx": 8192},
+                    },
+                    timeout=300,
+                )
+                if resp.status_code != 200:
+                    print_error(f"Ollama extraction failed: HTTP {resp.status_code}")
+                    return []
+                response_text = resp.json().get("response", "")
+            except Exception as e:
+                print_error(f"Ollama extraction error: {e}")
+                return []
+            questions = self._parse_question_list(response_text)
+            if questions:
+                break
+        # Light cleanup + dedupe while preserving order.
+        seen = set(); out: List[str] = []
+        for q in questions:
+            q = re.sub(r"\s+", " ", q).strip()
+            if len(q) > 10 and q.lower() not in seen:
+                seen.add(q.lower()); out.append(q)
+        return out
 
     # -----------------------
     # MathPix OCR pass (optional)
@@ -258,7 +413,10 @@ class QuestionExtractor:
             for i in range(doc.page_count):
                 try:
                     pix = self._render_page_to_image(doc, i, dpi=dpi)
-                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    mode = "RGBA" if pix.n == 4 else "RGB"
+                    img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+                    if mode == "RGBA":
+                        img = img.convert("RGB")
                     src = self._img_to_data_uri(img)
                     payload = {
                         "src": src,
@@ -291,45 +449,84 @@ class QuestionExtractor:
     # -----------------------
     # Question splitting and filtering
     # -----------------------
+    # Imperative/interrogative verbs that begin VIT exam questions.
+    _QUESTION_STARTERS = (
+        "discuss", "calculate", "explain", "compare", "highlight", "define",
+        "describe", "list", "derive", "write", "state", "give", "find",
+        "determine", "show", "prove", "illustrate", "mention", "differentiate",
+        "outline", "analyse", "analyze", "evaluate", "draw", "identify",
+        "what", "why", "how", "when", "where", "which", "who",
+    )
+
+    def _strip_marks_tokens(self, line: str) -> str:
+        """Remove trailing mark/CO/BL columns the layout text leaves on a line.
+
+        VIT papers put 'M CO BL' columns to the right of each question, so layout
+        extraction appends tokens like ' 4 2', ' 10', or ' 4 3' to question lines.
+        """
+        # Drop trailing runs of standalone 1-2 digit numbers (mark columns).
+        return re.sub(r"(\s+\d{1,2}){1,3}\s*$", "", line).strip()
+
     def _clean_question_text(self, q: str) -> str:
         q = re.sub(r"\s+", " ", q).strip()
+        q = re.sub(r"^\(?\s*[a-z]\s*\)?\s*", "", q)  # drop leading sub-part labels like 'k)' '(a)'
         q = re.sub(r"^\d+[\.)]\s*", "", q)
         q = re.sub(r"^(Q|Question)\s*\d+[:\.)]?\s*", "", q, flags=re.I)
         q = re.sub(r"\[?\(?\s*\d+\s*(marks?|pts?|points?)\s*\)?\]?$", "", q, flags=re.I).strip()
+        q = self._strip_marks_tokens(q)
         if q and q[-1] not in ".?!":
-            q = q + ("?" if "?" in q else "")
+            if q.lower().startswith(("what", "why", "how", "when", "where",
+                                     "which", "who", "is ", "are ", "do ", "does ",
+                                     "can ", "could ", "would ", "should ")):
+                q = q + "?"
         return q.strip()
+
+    def _is_question_start(self, line: str) -> bool:
+        s = re.sub(r"^\(?\s*[a-z]\s*\)?\s*", "", line.strip(), flags=re.I)  # ignore sub-part label
+        s = re.sub(r"^\(?\d+\)?[\.)]?\s*", "", s)  # ignore leading question number
+        first = re.split(r"\W+", s.lower(), maxsplit=1)
+        return bool(first and first[0] in self._QUESTION_STARTERS)
+
+    def _is_noise_line(self, line: str) -> bool:
+        s = line.strip().lower()
+        if re.fullmatch(r"[\d\s\.\)\(/:-]*", s):  # pure numbers / separators
+            return True
+        noise = (
+            "qn", "question", "m cobl", "m co bl", "answer all",
+            "max mark", "course outcome", "co-", "blooms", "bl -",
+            "general instruction", "programme name", "course code",
+            "faculty name", "class, number", "date of examination",
+            "exam duration", "maximum marks", "school of", "slot:",
+            "continuous assessment", "fall semester", "winter semester",
+            "vellore institute", "vit",
+        )
+        return any(s.startswith(n) or n in s for n in noise) and len(s) < 80
 
     def _extract_vit_questions(self, lines: List[str]) -> List[str]:
         questions: List[str] = []
         buffer = ""
         for raw in lines:
-            line = raw.strip()
-            if not line:
+            line = self._strip_marks_tokens(raw.strip())
+            if not line or self._is_noise_line(line):
                 continue
-            # New question starts
-            if re.match(r"^\(?\d+\)?[\.)]\s+", line) or re.match(r"^[Qq](uestion)?\s*\d+[:\.)]?\s+", line):
+            if self._is_question_start(line):
+                # A new question begins; flush the previous one.
                 if buffer:
                     questions.append(buffer.strip())
-                buffer = re.sub(r"^\(?\d+\)?[\.)]\s*", "", line)
-                buffer = re.sub(r"^[Qq](uestion)?\s*\d+[:\.)]?\s*", "", buffer)
-                continue
-            # Likely end when question mark at end or bullet options start
-            if re.search(r"\?$", line) and buffer:
+                buffer = line
+            elif buffer:
+                # Continuation of the current question.
                 buffer += " " + line
-                questions.append(buffer.strip())
-                buffer = ""
-                continue
-            # Continuation lines
-            if buffer:
-                buffer += " " + line
+                if line.endswith("?"):
+                    questions.append(buffer.strip())
+                    buffer = ""
         if buffer:
             questions.append(buffer.strip())
-        # Clean and dedupe
-        cleaned = [self._clean_question_text(q) for q in questions if len(q) > 20]
+        # Clean, keep only substantive items, and dedupe.
+        cleaned = [self._clean_question_text(q) for q in questions if len(q) > 25]
         seen = set(); out: List[str] = []
         for q in cleaned:
-            if q not in seen:
+            if len(q) > 15 and q not in seen:
                 seen.add(q); out.append(q)
         return out
 
@@ -347,17 +544,19 @@ class QuestionExtractor:
     # -----------------------
     # Public API
     # -----------------------
-    def extract_questions(self, file_path: str, topic: str, use_llm: bool = False, use_mathpix: bool = False) -> List[str]:
+    def extract_questions(self, file_path: str, topic: str, use_llm: bool = True, use_mathpix: bool = False) -> List[str]:
         print_progress("Extracting (pdfplumber)...")
         pages_lines = self._extract_with_pdfplumber(file_path)
-        # If plumber failed or produced too little content, OCR fallback
+        # If plumber failed or produced too little content, OCR fallback.
+        # Use avg chars/page — scanned PDFs often return a few header chars but nothing useful.
         total_chars = sum(len(l) for p in pages_lines for l in p)
-        if not pages_lines or total_chars < 50:
+        avg_chars = total_chars / max(len(pages_lines), 1)
+        if not pages_lines or avg_chars < 150:
             if use_mathpix and self._mathpix_available():
                 print_info("Falling back to MathPix OCR (best for math)...")
                 pages_lines = self._extract_with_mathpix(file_path)
             else:
-                print_info("Falling back to OCR (high-DPI render + Tesseract)...")
+                print_info("Falling back to OCR (high-DPI render + EasyOCR)...")
                 pages_lines = self._extract_with_ocr(file_path)
 
         if not pages_lines:
@@ -368,17 +567,24 @@ class QuestionExtractor:
         cleaned_lines = self._clean_pages(pages_lines)
         text = "\n".join(cleaned_lines)
 
-        if use_llm and self.llm_enabled:
-            print_progress("Running LLM-based cleaning...")
-            text = self._llm_clean_text(text)
+        # Primary path: let a local LLM extract every question cleanly. Fall back
+        # to the heuristic parser if the LLM is unavailable or returns nothing.
+        questions: List[str] = []
+        if use_llm and self.llm_enabled and self._ollama_available():
+            print_progress(f"Extracting questions via LLM ({self.model_name})...")
+            questions = self._llm_extract_questions(text, topic)
+            if questions:
+                print_success(f"Extracted {len(questions)} questions (LLM) from {os.path.basename(file_path)}")
+                return questions
+            print_info("LLM returned nothing; falling back to heuristic parser.")
 
-        print_progress("Parsing questions...")
+        print_progress("Parsing questions (heuristic)...")
         questions = self._extract_vit_questions(text.splitlines())
         filtered = self._filter_by_topic(questions, topic)
         print_success(f"Extracted {len(filtered)} questions from {os.path.basename(file_path)}")
         return filtered
 
-    def extract_from_multiple_papers(self, file_paths: List[str], topic: str, use_llm: bool = False, use_mathpix: bool = False) -> dict:
+    def extract_from_multiple_papers(self, file_paths: List[str], topic: str, use_llm: bool = True, use_mathpix: bool = False) -> dict:
         results = {
             'papers_processed': 0,
             'total_questions': 0,

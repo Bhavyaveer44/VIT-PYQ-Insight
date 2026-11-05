@@ -53,12 +53,12 @@ papers = scraper.scrape_papers('Computer Science', max_papers=5)
 print(f'Downloaded {len(papers)} papers')
 "
 
-# Extract questions
-python run_extract_all.py
+# Extract questions (run from the repository root)
+python -m backend.ai.agent.run_extract_all
 
-# View results
-type outputs\extracted_questions_all.json  # Windows
-cat outputs/extracted_questions_all.json   # Linux/Mac
+# View results (run from the repository root)
+Get-Content backend/ai/agent/outputs/extracted_questions_all.json  # PowerShell
+# macOS/Linux: cat backend/ai/agent/outputs/extracted_questions_all.json
 ```
 
 ### Step 3: Prepare for GitHub

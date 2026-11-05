@@ -20,6 +20,10 @@ from ai.agent.scraper import ExamScraper
 from ai.agent.extractor import QuestionExtractor
 from ai.agent.m import setup_directories, print_info, print_success, print_error
 
+AGENT_DIR = Path(__file__).resolve().parent / "backend" / "ai" / "agent"
+PAPERS_DIR = AGENT_DIR / "data" / "raw_papers"
+OUTPUTS_DIR = AGENT_DIR / "outputs"
+
 def main():
     print("=== VIT Exam Paper Processing Tool ===")
     print("Available features:")
@@ -77,7 +81,7 @@ def main():
                 extractor = QuestionExtractor()
                 
                 # Check for PDFs in data/raw_papers
-                pdf_dir = Path("data/raw_papers")
+                pdf_dir = PAPERS_DIR
                 if not pdf_dir.exists():
                     pdf_dir.mkdir(parents=True, exist_ok=True)
                     print_error(f"No PDFs found in {pdf_dir}")
@@ -105,8 +109,9 @@ def main():
                 print_info(f"Total unique questions extracted: {results['unique_questions']}")
                 
                 # Save results
-                output_file = f"outputs/extracted_questions_{topic or 'all'}.json"
-                extractor.save_questions(results['combined_questions'], topic or 'all', 'VIT Exam Papers', output_file)
+                OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+                output_file = OUTPUTS_DIR / f"extracted_questions_{topic or 'all'}.json"
+                extractor.save_questions(results['combined_questions'], topic or 'all', 'VIT Exam Papers', str(output_file))
                 print_success(f"Results saved to {output_file}")
                 
                 # Show sample questions

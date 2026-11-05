@@ -13,6 +13,16 @@ import platform
 from pathlib import Path
 from typing import Any, Dict, Optional, List
 
+# Ensure the console can render the Unicode glyphs used below (✓ ✗ ℹ …).
+# On Windows the default cp1252 stdout raises UnicodeEncodeError; switch it to
+# UTF-8 with a safe replacement fallback so logging never crashes the pipeline.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
 # Color codes for terminal output (works on most terminals)
 class Colors:
     GREEN = '\033[92m'
@@ -54,7 +64,10 @@ def print_warning(message: str):
     print(_colorize(Colors.YELLOW, f"⚠ {message}"))
 
 
-def setup_directories():
+def setup_directories(base_dir=None):
+    # Anchor on this module's directory by default so the dirs land alongside the
+    # agent code (and the existing data/raw_papers) regardless of the CWD.
+    base = Path(base_dir) if base_dir is not None else Path(__file__).resolve().parent
     directories = [
         "data",
         "data/raw_papers",
@@ -64,7 +77,7 @@ def setup_directories():
         "logs"
     ]
     for directory in directories:
-        Path(directory).mkdir(parents=True, exist_ok=True)
+        (base / directory).mkdir(parents=True, exist_ok=True)
 
 
 def save_json(data: Any, file_path: str, pretty: bool = True):

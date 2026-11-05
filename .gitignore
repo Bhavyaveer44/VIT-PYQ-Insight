@@ -43,7 +43,6 @@ env/
 .DS_Store
 
 # Downloads and Cache
-data/raw_papers/*.pdf
 backend/ai/agent/data/raw_papers/*.pdf
 backend/ai/agent/data/cache/*
 .cache/
@@ -72,3 +71,6 @@ npm-debug.log
 
 # Playwright (if using)
 .env
+
+# Keep the safe template in version control
+!.env.example

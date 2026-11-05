@@ -3,14 +3,21 @@ requests>=2.31.0
 beautifulsoup4>=4.12.0
 python-dotenv>=1.0.0
 
+# Web framework
+flask>=3.0.0
+
+# Frontend
+streamlit>=1.30.0
+
 # PDF processing
 PyPDF2>=3.0.1
 pdfplumber>=0.9.0
 PyMuPDF>=1.23.0
 
 # OCR and image processing
-pytesseract>=0.3.10
+easyocr>=1.7.1
 Pillow>=10.0.0
+numpy>=1.24.0
 
 # PowerPoint processing
 python-pptx>=0.6.21
@@ -27,7 +34,3 @@ playwright>=1.40.0
 
 # Optional: MathPix API for better OCR (requires API keys)
 # mathpix-client>=4.0.0
-
-# Web framework (if you want to build a simple API)
-flask>=2.3.0
-flask-cors>=4.0.0

@@ -8,6 +8,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.chat_models import ChatOllama
+from backend.ai.ollama_utils import ollama_config, ollama_preflight
 
 def load_pptx_text(pptx_path):
     """
@@ -29,27 +30,42 @@ def summarize_pptx():
     """
     Main function to summarize PPTX using Ollama models locally.
     """
-    pptx_path = input("Please enter the full path to your PPTX file: ")
-    if not os.path.exists(pptx_path):
+    pptx_path = input("Please enter the full path to your PPTX file: ").strip().strip('"')
+    if not os.path.isfile(pptx_path):
         print(f"Error: The file '{pptx_path}' does not exist.")
+        return
+    if not pptx_path.lower().endswith(".pptx"):
+        print("Error: Please choose a .pptx file.")
         return
 
     try:
         # --- Load and Split ---
         print("Loading and splitting PPTX...")
         docs = load_pptx_text(pptx_path)
+        if not docs:
+            print("Error: No readable slide text was found in this presentation.")
+            return
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         splits = text_splitter.split_documents(docs)
+        if not splits:
+            print("Error: No text chunks could be created from this presentation.")
+            return
+
+        error = ollama_preflight()
+        if error:
+            print(f"Error: {error}")
+            return
+        _, model, embedding_model = ollama_config()
 
         # --- Embeddings using Ollama ---
         print("Creating vector store with Ollama embeddings...")
-        embeddings = OllamaEmbeddings(model="snowflake-arctic-embed") 
+        embeddings = OllamaEmbeddings(model=embedding_model)
         vectorstore = FAISS.from_documents(splits, embeddings)
         retriever = vectorstore.as_retriever()
 
         # --- Ollama LLM for Summarization ---
         print("Loading Ollama LLM...")
-        llm = ChatOllama(model="koesn/llama3-8b-instruct:latest")  
+        llm = ChatOllama(model=model)
 
         # --- Prompt Template ---
         prompt_template = """Use the following context to answer the question:
