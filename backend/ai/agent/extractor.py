@@ -98,9 +98,7 @@ class QuestionExtractor:
             with pdfplumber.open(file_path) as pdf:
                 for page in pdf.pages:
                     try:
-                        raw = page.extract_text(layout=True) or ""
-                        lines = [re.sub(r"\s+", " ", l).strip() for l in raw.splitlines()]
-                        lines = [l for l in lines if l]
+                        lines = self._extract_page_lines(page)
                     except Exception:
                         raw = page.extract_text(x_tolerance=1.5, y_tolerance=3.0) or ""
                         lines = [l.strip() for l in raw.splitlines() if l.strip()]
@@ -109,6 +107,21 @@ class QuestionExtractor:
             print_error(f"pdfplumber failed on {os.path.basename(file_path)}: {e}")
             return []
         return pages_lines
+
+    def _extract_page_lines(self, page) -> List[str]:
+        """Read PDF text in visual order, using column order for two-column pages."""
+        words = page.extract_words(x_tolerance=2, y_tolerance=3, keep_blank_chars=False) or []
+        width = float(page.width)
+        left = [word for word in words if float(word.get("x1", 0)) <= width * 0.48]
+        right = [word for word in words if float(word.get("x0", width)) >= width * 0.52]
+        if len(left) >= 8 and len(right) >= 8:
+            left_text = page.crop((0, 0, width * 0.5, page.height)).extract_text(x_tolerance=2, y_tolerance=3) or ""
+            right_text = page.crop((width * 0.5, 0, width, page.height)).extract_text(x_tolerance=2, y_tolerance=3) or ""
+            if left_text.strip() and right_text.strip():
+                raw = left_text + "\n" + right_text
+                return [re.sub(r"\s+", " ", line).strip() for line in raw.splitlines() if line.strip()]
+        raw = page.extract_text(layout=True) or ""
+        return [re.sub(r"\s+", " ", line).strip() for line in raw.splitlines() if line.strip()]
 
     # -----------------------
     # OCR Fallback (PyMuPDF + EasyOCR)
@@ -455,8 +468,23 @@ class QuestionExtractor:
         "describe", "list", "derive", "write", "state", "give", "find",
         "determine", "show", "prove", "illustrate", "mention", "differentiate",
         "outline", "analyse", "analyze", "evaluate", "draw", "identify",
-        "what", "why", "how", "when", "where", "which", "who",
+        "what", "why", "how", "when", "where", "which", "who", "whom",
+        "whose", "is", "are", "was", "were", "do", "does", "did", "can",
+        "could", "would", "should", "will", "shall", "obtain", "construct",
+        "compute", "design", "estimate", "justify", "interpret", "summarize",
+        "trace", "perform", "assess", "comment", "implement", "examine",
+        "given", "suppose", "assuming", "using", "based",
+        "discuss", "calculate", "explain", "compare", "highlight", "define",
+        "describe", "list", "derive", "write", "state", "give", "find",
+        "determine", "show", "prove", "illustrate", "mention", "differentiate",
+        "outline", "analyse", "analyze", "evaluate", "draw", "identify",
     )
+
+    _LABEL_RE = re.compile(
+        r"^\s*(?P<label>(?:\(?\d{1,2}\)?[.)]|\(?[a-z]\)?[.)]|\(?[ivxlcdm]{1,5}\)?[.)]))\s*(?P<body>.*)$",
+        re.I,
+    )
+    _NUMBERED_RE = re.compile(r"^\s*(?:Q(?:uestion)?\s*)?\d{1,2}\s*[.) :]\s*(?P<body>.+)$", re.I)
 
     def _strip_marks_tokens(self, line: str) -> str:
         """Remove trailing mark/CO/BL columns the layout text leaves on a line.
@@ -469,8 +497,7 @@ class QuestionExtractor:
 
     def _clean_question_text(self, q: str) -> str:
         q = re.sub(r"\s+", " ", q).strip()
-        q = re.sub(r"^\(?\s*[a-z]\s*\)?\s*", "", q)  # drop leading sub-part labels like 'k)' '(a)'
-        q = re.sub(r"^\d+[\.)]\s*", "", q)
+        q = self._question_body(q)
         q = re.sub(r"^(Q|Question)\s*\d+[:\.)]?\s*", "", q, flags=re.I)
         q = re.sub(r"\[?\(?\s*\d+\s*(marks?|pts?|points?)\s*\)?\]?$", "", q, flags=re.I).strip()
         q = self._strip_marks_tokens(q)
@@ -482,15 +509,30 @@ class QuestionExtractor:
         return q.strip()
 
     def _is_question_start(self, line: str) -> bool:
-        s = re.sub(r"^\(?\s*[a-z]\s*\)?\s*", "", line.strip(), flags=re.I)  # ignore sub-part label
-        s = re.sub(r"^\(?\d+\)?[\.)]?\s*", "", s)  # ignore leading question number
+        s = line.strip()
+        match = self._NUMBERED_RE.match(s) or self._LABEL_RE.match(s)
+        if match:
+            s = match.group("body").strip()
         first = re.split(r"\W+", s.lower(), maxsplit=1)
         return bool(first and first[0] in self._QUESTION_STARTERS)
+
+    def _is_subquestion_start(self, line: str) -> bool:
+        match = self._LABEL_RE.match(line.strip())
+        if not match or not match.group("body").strip():
+            return False
+        body = match.group("body").strip()
+        return self._is_question_start(body) or len(body) >= 20
+
+    def _question_body(self, line: str) -> str:
+        match = self._NUMBERED_RE.match(line.strip()) or self._LABEL_RE.match(line.strip())
+        return match.group("body").strip() if match else line.strip()
 
     def _is_noise_line(self, line: str) -> bool:
         s = line.strip().lower()
         if re.fullmatch(r"[\d\s\.\)\(/:-]*", s):  # pure numbers / separators
             return True
+        if re.match(r"^q(?:uestion)?\s*\d+\s*[:.)-]", s):
+            return False
         noise = (
             "qn", "question", "m cobl", "m co bl", "answer all",
             "max mark", "course outcome", "co-", "blooms", "bl -",
@@ -509,21 +551,20 @@ class QuestionExtractor:
             line = self._strip_marks_tokens(raw.strip())
             if not line or self._is_noise_line(line):
                 continue
-            if self._is_question_start(line):
-                # A new question begins; flush the previous one.
+            if self._is_question_start(line) or self._is_subquestion_start(line):
                 if buffer:
                     questions.append(buffer.strip())
-                buffer = line
+                buffer = self._question_body(line)
+            elif buffer and line.endswith(("?", ".", ":")):
+                questions.append((buffer + " " + line).strip())
+                buffer = ""
             elif buffer:
                 # Continuation of the current question.
                 buffer += " " + line
-                if line.endswith("?"):
-                    questions.append(buffer.strip())
-                    buffer = ""
         if buffer:
             questions.append(buffer.strip())
         # Clean, keep only substantive items, and dedupe.
-        cleaned = [self._clean_question_text(q) for q in questions if len(q) > 25]
+        cleaned = [self._clean_question_text(q) for q in questions if len(q) > 15]
         seen = set(); out: List[str] = []
         for q in cleaned:
             if len(q) > 15 and q not in seen:

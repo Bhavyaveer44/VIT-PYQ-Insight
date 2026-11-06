@@ -169,7 +169,7 @@ def main():
         print("2. Run: python main_demo.py")
         print("3. Choose option 3 to scrape papers")
         print("4. Choose option 4 to extract questions")
-        print("\nFor more details, see: QUICK_START.md")
+        print("\nFor more details, see: README.md")
         return 0
     else:
         print_header("⚠ Setup Incomplete")

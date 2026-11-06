@@ -57,7 +57,7 @@ ollama pull snowflake-arctic-embed
 
 ## Usage
 
-### 🚀 Quick Start - Interactive Menu (Easiest)
+### Quick Start - Interactive Menu (Easiest)
 
 The easiest way to use all features:
 
